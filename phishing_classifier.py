@@ -7,20 +7,37 @@ import os
 from os.path import splitext
 import pandas as pd
 import numpy as np
-import matplotlib.pylab as plt
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pickle as pkl
 import ipaddress
 import tldextract
-import whois
+#import whois # (pip install python-whois)
 from urlparse import urlparse
-import datetime
 import re
 import logging
 import base64
 import urllib2
 
+import sklearn.ensemble as ek
+from sklearn import cross_validation,tree, linear_model
+from sklearn.feature_selection import SelectFromModel
+from sklearn.externals import joblib
+from sklearn.linear_model import LogisticRegression
+from sklearn import svm
+from sklearn import preprocessing
+from sklearn.metrics import confusion_matrix
+from sklearn.naive_bayes import GaussianNB
+from sklearn.externals import joblib
+from sklearn.pipeline import make_pipeline
+
 # setup logging
 logging.basicConfig(stream=sys.stdout,level = logging.DEBUG)
 logger = logging.getLogger(__name__)
+
+# extract callable that falls back to the included TLD snapshot, no live HTTP fetching
+# https://github.com/john-kurkowski/tldextract
+tld_extract = tldextract.TLDExtract(suffix_list_urls=None)
 
 # Count no of dots in domain
 def count_dots(url):
@@ -29,19 +46,21 @@ def count_dots(url):
 # Count no of delimiters
 def count_delimiters(url):
     delim = 0
-    delim = [';', '_', '?', '=', '&']
+    delim_chars = [';', '_', '?', '=', '&']
     for char in url:
-        if char in delim:
+        if char in delim_chars:
             delim +=1
-    return count
+    return delim
 
 # Check if ip is present in string
 def ip_in_string(str):
     r_exp=re.compile('\\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\\b')
     response = r_exp.findall(str)
     if response:
-        return response
-    else: return None
+        #return response
+        return True 
+    # else: return None
+    else: return False
 
 # Check if ip is present in url string
 def ip_in_url(url):
@@ -49,8 +68,10 @@ def ip_in_url(url):
     u = urlparse(url)
     response = r_exp.findall(u.netloc)
     if response:
-        return response
-    else: return None
+        #return response
+        return True
+    #else: return None
+    else: return False
 
 # Check if string is base64 encoded
 def detect_base64_string(base64_string):
@@ -108,28 +129,15 @@ def count_queries(query):
         return len(query.split('&'))
 
 def url_parameters(url):
-    url_dict = dict()
     url_results = urlparse(url)
-    url_dict['scheme'] = url_results.scheme
-    url_dict['netloc'] = url_results.netloc
-    url_dict['path'] = url_results.path
-    url_dict['params'] = url_results.params
-    url_dict['query'] = url_results.query
-    url_dict['fragment'] = url_results.fragment
-    return url_dict
+    #return [url_results.scheme,url_results.netloc,url_results.path,url_results.params,url_results.query,url_results.fragment]
+    return pd.Series((url_results.scheme,url_results.netloc,url_results.path,url_results.params,url_results.query,url_results.fragment))
+
 
 def url_domain_info(url):
-    url_info = dict()
-    url_results = tldextract.extract(url)
-    url_dict['domain'] = url_results.domain
-    url_dict['subdomain'] = url_results.subdomain
-    url_dict['suffix'] = url_results.suffix
+    url_results = tld_extract(url)
+    return pd.Series((url_results.domain, url_results.subdomain, url_results.suffix))
 
-
-
-df = pd.read_csv('dataset.csv')
-print df.head()
-print df.tail()
 
 # Top 20 suspicious domains - Symantec report
 # https://www.symantec.com/blogs/feature-stories/top-20-shady-top-level-domains
@@ -145,7 +153,7 @@ custom_tld_domains = ['.ru','.pk','.cn', 'pw','top','ga','ml']
 
 tld_domains += custom_tld_domains
 
-print list(set(tld_domains))
+#print list(set(tld_domains))
 
 # Top 10 malicious domains - Trendmicro report
 # http://apac.trendmicro.com/apac/security-intelligence/current-threat-activity/malicious-top-ten/
@@ -155,63 +163,141 @@ malware_domains = ['trafficconverter.biz','www.funad.co.kr','deepspacer.com',
 'tags.expo9.exponential.com','bembed.redtube.comr','dl.baixaki.com.br',
 'www.trafficholder.com','mattfoll.eu.interia.pl','www.luckytime.co.kr']
 
-def get_features(url):
-    # extract features from url
-    results = list()
-    # url
-    results.append( str(url) )
 
-    # length of url
-    results.append(len(url))
+df = pd.read_csv('dataset.csv')
+#df = pd.read_csv('single_entry.csv')
+#print df.head()
+#print df.tail()
 
-    # count delimiters
-    results.append(count_delimiters(url))
+# decode/unquote the url
+df['URL'] = df.apply(lambda row: url_decode(row['URL']), axis=1)
 
-    # url parameters
-    url_results = url_parameters(url)
-    results.append(url_results['scheme'])
-    results.append(url_results['netloc'])
-    results.append(url_results['path'])
-    results.append(url_results['params'])
-    results.append(url_results['query'])
-    results.append(url_results['fragment'])
+# url length
+df['url_length'] = df.apply(lambda row: len(row['URL']),axis=1)
 
-    # url domain info
-    domain_results =url_domain_info(url)
-    results.append(domain_results['domain'])
-    results.append(domain_results['subdomain'])
-    results.append(domain_results['suffix'])
+# url delimiters
+df['url_delimiter'] = df.apply(lambda row: count_delimiters(row['URL']),axis=1)
 
-    # count query parameters in url
-    results.append(count_queries(url_results['query']))
+# count hypen characters in url
+df['hypen_char_url'] = df.apply(lambda row: count_hypen(row['URL']), axis=1)
 
-    # count subdomains
-    results.append(count_subdomains(domain_results['subdomain']))
+# count slash characters in url
+df['slash_char_url'] = df.apply(lambda row: count_slash(row['URL'].split('://')[1]), axis=1)
 
-    # no of dots in subdomain
-    results.append(count_dots(domain_results['subdomain'])
+# count doubleslash characters in url
+df['doubleslash_char_url'] = df.apply(lambda row: count_doubleslash(row['URL'].split('://')[1]), axis=1)
 
-    # no of delimites in domain
-    results.append(count_delimiters(domain_results['domain']))
+# count at characters in url
+df['at_char_url'] = df.apply(lambda row: count_at_symbol(row['URL']), axis=1)
 
-    # no of delimites in subdomain
-    results.append(count_delimiters(domain_results['subdomain']))
+# get extension(useful for tracking the file that is downloaded.)
+df['extension'] = df.apply(lambda row: get_extension(row['URL']), axis=1)
 
-    # count no of subdirectories :'/'
-    results.append(count_slash(url_results['path']))
+# check if ip is present in url
+df['ip_in_url'] = df.apply(lambda row: ip_in_url(row['URL']), axis=1)
 
-    # count no of doubleslash:'//'
-    results.append(count_doubleslash(url_results['path']))
+# url parameters
+df[['url_scheme','url_netloc','url_path','url_parameters','url_query','url_fragment']] \
+   = df.apply(lambda row: url_parameters(row['URL']), axis=1)
 
-    # count @ in url
-    results.append(count_at_symbol(url_results['netloc']))
+# url domain details
+df[['url_domain', 'url_subdomain', 'url_suffix']] \
+   = df.apply(lambda row: url_domain_info(row['URL']), axis=1)
 
-    # count '-' in domain
-    results.append(count_hypen(url_results['netloc']))
+# dots in domain
+df['dots_domain'] = df.apply(lambda row: count_dots(row['url_domain']),axis=1)
 
-    # length of domain
-    results.append(len(domain_results['domain']))
+# length of domain
+df['length_domain'] = df.apply(lambda row: len(row['url_domain']),axis=1)
 
-    # length of subdomain
-    results.append(len(domain_results['subdomain']))
+# dots in subdomain
+df['dots_subdomain'] = df.apply(lambda row: count_dots(row['url_subdomain']),axis=1)
+
+# length of subdomain
+df['length_subdomain'] = df.apply(lambda row: len(row['url_subdomain']),axis=1)
+
+
+# count url query parameters
+df['url_query_parameters'] = df.apply(lambda row: count_queries(row['url_query']), axis=1)
+
+# check if url query is base64 encoded
+df['url_query_base64'] = df.apply(lambda row: detect_base64_string(row['url_query']), axis=1)
+
+# count url subdomains
+df['url_subdomains'] = df.apply(lambda row: count_subdomains(row['url_subdomain']), axis=1)
+
+# count hypen characters in domain
+df['hypen_char_fulldomain'] = df.apply(lambda row: count_hypen(row['url_domain'] + row['url_subdomain'] + row['url_suffix']), axis=1)
+
+
+#print df[:1].values
+#print df.head()
+
+####################
+## Visualization - distribution of variables
+#####################
+
+#sns.set(style="darkgrid")
+#sns.distplot(df[df['Lable']==0]['url_length'],color='green',label='Benign URLs')
+#sns.distplot(df[df['Lable']==1]['url_length'],color='red',label='Phishing URLs')
+#plt.title('url length distribution')
+#plt.legend(loc='upper right')
+#plt.xlabel('url length')
+#plt.show()
+
+
+#sns.distplot(df[df['Lable']==0]['hypen_char_url'],color='green',label='Benign URLs')
+#sns.distplot(df[df['Lable']==1]['hypen_char_url'],color='red',label='Phishing URLs')
+#plt.title('hypen char distribution')
+#plt.legend(loc='upper right')
+#plt.xlabel('hypen chars')
+#plt.show()
+
+#sns.distplot(df[df['Lable']==0]['length_domain'],color='green',label='Benign URLs')
+#sns.distplot(df[df['Lable']==1]['length_domain'],color='red',label='Phishing URLs')
+#plt.title('domain length distribution')
+#plt.legend(loc='upper right')
+#plt.xlabel('domain length')
+#plt.show()
+
+#sns.distplot(df[df['Lable']==0]['length_subdomain'],color='green',label='Benign URLs')
+#sns.distplot(df[df['Lable']==1]['length_subdomain'],color='red',label='Phishing URLs')
+#plt.title('domain length distribution')
+#plt.legend(loc='upper right')
+#plt.xlabel('domain length')
+#plt.show()
+
+print df.groupby(df['Lable']).size()
+
+X = df.drop(['URL','Lable','extension','url_scheme','url_netloc','url_path','url_parameters','url_query','url_fragment','url_domain', 'url_subdomain', 'url_suffix'],axis=1).values
+y = df['Lable'].values
+
+model = { "DecisionTree":tree.DecisionTreeClassifier(max_depth=10),
+         "RandomForest":ek.RandomForestClassifier(n_estimators=50),
+         "Adaboost":ek.AdaBoostClassifier(n_estimators=50),
+         "GradientBoosting":ek.GradientBoostingClassifier(n_estimators=50),
+         "GNB":GaussianNB(),
+         "LogisticRegression":LogisticRegression()   
+}
+
+# cross validation
+X_train, X_test, y_train, y_test = cross_validation.train_test_split(X, y ,test_size=0.2)
+
+results = {}
+for algo in model:
+    clf = model[algo]
+    clf.fit(X_train,y_train)
+    score = clf.score(X_test,y_test)
+    print ("%s : %s " %(algo, score))
+    results[algo] = score
+
+winner = max(results, key=results.get)
+print(winner)
+
+clf = model[winner]
+res = clf.predict(X)
+mt = confusion_matrix(y, res)
+print mt
+print("False positive rate : %f %%" % ((mt[0][1] / float(sum(mt[0])))*100))
+print('False negative rate : %f %%' % ( (mt[1][0] / float(sum(mt[1]))*100)))
 
